@@ -1,21 +1,25 @@
 """
-Lid -> Excel bot
-----------------
-Lid xabarini (🧾 Nomi: ... 📝 Ma'lumotlar: ...) botga tashlaysiz,
-bot uni ajratib oladi va bitta Excel faylga qator qilib qo'shadi.
+Lid -> Excel bot + Guruh qidiruvi dasturi
+-----------------------------------------
+1) Lid xabarini (🧾 Nomi: ... 📝 Ma'lumotlar: ...) botga tashlaysiz,
+   bot uni ajratib oladi va Excel faylga qator qilib qo'shadi.
+2) Bot manzilida (Render linki) "Guruh qidiruvi" dasturi ochiladi (index.html).
+   Dastur lidlarni botdan oladi, ularni mos guruhga avtomatik joylaydi,
+   siz holatini belgilaysiz - hammasi Excel'ga ham yoziladi.
+   Dasturga kirish linki: botga /dastur yozing.
 
 Env o'zgaruvchilar (Render > Environment):
   BOT_TOKEN   - BotFather bergan token (majburiy)
   ADMIN_IDS   - botdan foydalana oladiganlar ID si, vergul bilan: 123456789,987654321
-                (bo'sh qolsa, hamma foydalana oladi; ID ni /start bilan bilib olasiz)
-  SELF_URL    - Render'dagi bot linki (masalan https://lid-bot.onrender.com)
-                bo'lsa, bot uxlab qolmasligi uchun o'ziga har 9 daqiqada ping yuboradi.
-                (Render o'zi RENDER_EXTERNAL_URL ni ham beradi - SELF_URL bo'lmasa o'shani oladi)
+  SELF_URL    - (ixtiyoriy) bot linki; bo'lmasa Render bergan RENDER_EXTERNAL_URL olinadi
   SEND_DELAY  - oxirgi lid tushgandan keyin necha soniyada Excel yuborilsin (standart 4)
 """
 
 import asyncio
+import hashlib
+import hmac
 import io
+import json
 import logging
 import os
 import re
@@ -23,14 +27,13 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from telegram import Update
-
-from guruhlar import GURUHLAR, KURS_TURI, TAKLIF_SONI, USTOZLAR, VAQT_ORALIQ, XONA_SIGIMI, XONALAR
+from telegram import InputMediaDocument, Update
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -45,30 +48,43 @@ logging.getLogger("httpx").setLevel(logging.WARNING)  # token loglarda chiqmasin
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in re.findall(r"\d+", os.environ.get("ADMIN_IDS", ""))}
-SELF_URL = os.environ.get("SELF_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")
+SELF_URL = (os.environ.get("SELF_URL") or os.environ.get("RENDER_EXTERNAL_URL", "")).rstrip("/")
 SEND_DELAY = float(os.environ.get("SEND_DELAY", "4"))
 LOCAL_FILE = "lidlar.xlsx"
 DATE_FMT = "%d-%m-%Y %H:%M:%S"
+HERE = os.path.dirname(os.path.abspath(__file__))
+INDEX_FILE = os.path.join(HERE, "index.html")
+
+# Dasturga kirish kaliti - bot tokenidan yasaladi (alohida parol kerak emas)
+WEB_KEY = hashlib.sha256(("dastur:" + BOT_TOKEN).encode()).hexdigest()[:20]
+
+HOLATLAR = ["Yangi", "Qo'ng'iroq qilindi", "Guruhga qo'shildi", "Rad etdi"]
 
 # ---------------------------------------------------------------- Excel tuzilishi
 # (kalit, sarlavha, kenglik)
 INFO_COLS = [
-    ("daraja", "Daraja", 12),
-    ("kurs", "Kurs", 16),
+    ("daraja", "Daraja", 10),
+    ("kurs", "Kurs", 15),
+    ("kun", "Kunlar", 11),
     ("vaqt", "Vaqt", 14),
     ("ism", "Ism-familiya", 24),
     ("tel", "Telefon", 17),
 ]
 LEFT_COLS = [("n", "№", 6)]
-RIGHT_COLS = [("taklif", "Mos guruhlar (taklif)", 66), ("manba", "Manba", 13), ("sana", "Sana", 19)]
+RIGHT_COLS = [
+    ("guruh", "Guruh", 48),
+    ("holat", "Holat", 19),
+    ("manba", "Manba", 13),
+    ("sana", "Sana", 19),
+]
 ALL_COLS = LEFT_COLS + INFO_COLS + RIGHT_COLS
 
 rows: list[dict] = []  # barcha lidlar (xotirada)
+lock = threading.RLock()  # rows ga bot va dastur bir vaqtda tegmasligi uchun
+state = {"dirty": False}  # dasturda o'zgarish bo'ldi - Excel yangilansin
 
 # ---------------------------------------------------------------- Xabarni o'qish
 QUESTION_RE = re.compile(r"^\s*\d+\s*[.)]\s*(.+?)\s*:\s*(.*)$")
-
-
 IGNORED = ("form name", "ad name", "campaign", "adset", "ad set", "forma", "e'lon")
 
 
@@ -80,8 +96,10 @@ def field_for(question: str) -> str | None:
         return "daraja"
     if "kurs" in q or "course" in q:
         return "kurs"
-    if "vaqt" in q or "time" in q:
+    if "vaqt" in q or "time" in q or "soat" in q:
         return "vaqt"
+    if "kun" in q or "day" in q:
+        return "kun"
     if "phone" in q or "telefon" in q or "raqam" in q or "nomer" in q:
         return "tel"
     if "full name" in q or "ism" in q or "fio" in q or "f.i.sh" in q or q == "name":
@@ -105,7 +123,7 @@ def parse_block(lines: list[str]) -> dict | None:
             if key and m.group(2).strip() and key not in lead:
                 lead[key] = m.group(2).strip()
             continue
-        for key, label in (("nomi", "Nomi:"), ("manba", "Manba:"), ("sana", "Sana:")):
+        for key, label in (("manba", "Manba:"), ("sana", "Sana:")):
             if label in line:
                 lead[key] = line.split(label, 1)[1].strip()
     if not (lead.get("tel") or lead.get("ism")):
@@ -117,6 +135,7 @@ def parse_block(lines: list[str]) -> dict | None:
             lead["sana"] = datetime.strptime(lead["sana"], DATE_FMT)
         except ValueError:
             pass
+    lead["holat"] = "Yangi"
     return lead
 
 
@@ -140,197 +159,24 @@ def lead_key(lead: dict) -> tuple:
     return (re.sub(r"\D", "", str(lead.get("tel", ""))), str(sana or ""), str(lead.get("ism", "")).lower())
 
 
+def lead_id(lead: dict) -> str:
+    return hashlib.sha1("|".join(lead_key(lead)).encode()).hexdigest()[:12]
+
+
 def add_leads(new: list[dict]) -> tuple[int, int]:
-    known = {lead_key(r) for r in rows}
-    added = dup = 0
-    for lead in new:
-        k = lead_key(lead)
-        if k in known:
-            dup += 1
-            continue
-        known.add(k)
-        rows.append(lead)
-        added += 1
-    return added, dup
-
-
-# ---------------------------------------------------------------- Guruhga moslash
-KUN_NOMI = {"toq": "Du/Chor/Ju", "juft": "Se/Pay/Shan"}
-
-
-def to_min(hhmm: str) -> int:
-    h, m = str(hhmm).strip().split(":")
-    return int(h) * 60 + int(m)
-
-
-def fmt_min(m: int) -> str:
-    return f"{m // 60:02d}:{m % 60:02d}"
-
-
-def vaqt_of(start: int) -> str | None:
-    for name, (a, b) in VAQT_ORALIQ.items():
-        if to_min(a) <= start < to_min(b):
-            return name
-    return None
-
-
-def g_interval(g: dict) -> tuple[int, int]:
-    s = to_min(g["soat"])
-    return s, s + int(g.get("davom", 120))
-
-
-def slot_interval(x: dict) -> tuple[int, int]:
-    a, b = x["vaqt"].split("-")
-    return to_min(a), to_min(b)
-
-
-def overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:
-    return a[0] < b[1] and b[0] < a[1]
-
-
-def slot_conflict(x: dict) -> dict | None:
-    """Shu vaqtda xonada dars o'tayotgan guruh (bo'lsa)."""
-    for g in GURUHLAR:
-        if g["xona"] == x["xona"] and g["kunlar"] == x["kunlar"] and overlap(g_interval(g), slot_interval(x)):
-            return g
-    return None
-
-
-def teacher_busy(ustoz: str, kunlar: str, iv: tuple[int, int]) -> bool:
-    return any(g["ustoz"] == ustoz and g["kunlar"] == kunlar and overlap(g_interval(g), iv) for g in GURUHLAR)
-
-
-def norm_daraja(s: str) -> str | None:
-    s = str(s or "").lower().replace(" ", "")
-    m = re.search(r"[abc][0-2]", s)
-    if m:
-        return m.group(0)
-    if "boshlang" in s or "nol" in s or "0dan" in s:
-        return "a1"
-    if "o'rta" in s or "orta" in s or "o‘rta" in s:
-        return "b1"
-    return None
-
-
-def norm_kurs(s: str) -> str:
-    s = str(s or "").lower()
-    for key, tur in KURS_TURI.items():
-        if key in s:
-            return tur
-    return "umumiy"
-
-
-def norm_vaqt(s: str) -> str | None:
-    s = str(s or "").lower()
-    if "ertal" in s:
-        return "ertalab"
-    if "kundu" in s or "tush" in s or "peshin" in s or "obed" in s:
-        return "kunduzi"
-    if "kech" in s or "oqshom" in s:
-        return "kechki"
-    return None
-
-
-def match_groups(lead: dict) -> list[tuple[dict, list[str]]]:
-    """Lidga eng mos mavjud guruhlar: [(guruh, [mos kelmagan narsalar]), ...]"""
-    lvl, tur, vq = norm_daraja(lead.get("daraja")), norm_kurs(lead.get("kurs")), norm_vaqt(lead.get("vaqt"))
-    scored = []
-    for g in GURUHLAR:
-        ok_kurs = g["tur"] == tur
-        ok_lvl = lvl is None or lvl in g["daraja"]
-        ok_vaqt = vq is None or vaqt_of(to_min(g["soat"])) == vq
-        score = 4 * ok_kurs + 2 * ok_lvl + 2 * ok_vaqt
-        if score < 4:  # kurs ham, daraja+vaqt ham mos emas - taklif qilinmaydi
-            continue
-        miss = [name for ok, name in ((ok_kurs, "kurs"), (ok_lvl, "daraja"), (ok_vaqt, "vaqt")) if not ok]
-        scored.append((score, g.get("talaba", 0), g, miss))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [(g, miss) for _, _, g, miss in scored[:TAKLIF_SONI]]
-
-
-def free_slots() -> list[tuple[dict, dict | None]]:
-    """Barcha bo'sh xona vaqtlari va (agar bo'lsa) ular bilan to'qnashgan guruh."""
-    return [(x, slot_conflict(x)) for x in XONALAR]
-
-
-def new_group_options(lead: dict) -> list[tuple[dict, str]]:
-    """Yangi guruh ochish uchun: [(bo'sh xona vaqti, ustoz), ...]"""
-    tur, vq = norm_kurs(lead.get("kurs")), norm_vaqt(lead.get("vaqt"))
-    opts, seen = [], set()
-    for x, conflict in free_slots():
-        if conflict:
-            continue
-        iv = slot_interval(x)
-        slot_vaqt = vaqt_of(iv[0])
-        if vq and slot_vaqt != vq:
-            continue
-        candidates = [x["ustoz"]] if x.get("ustoz") else list(USTOZLAR)
-        for t in candidates:
-            info = USTOZLAR.get(t)
-            if not info or tur not in info["turlar"] or slot_vaqt not in info["vaqtlar"]:
+    with lock:
+        known = {lead_key(r) for r in rows}
+        added = dup = 0
+        for lead in new:
+            k = lead_key(lead)
+            if k in known:
+                dup += 1
                 continue
-            if teacher_busy(t, x["kunlar"], iv):
-                continue
-            key = (t, x["kunlar"], x["vaqt"])  # bir ustozni bir vaqtga bir marta taklif qilamiz
-            if key in seen:
-                continue
-            seen.add(key)
-            prio = 0 if x.get("ustoz") else 1  # ustozga ajratilgan vaqt birinchi
-            opts.append((prio, -XONA_SIGIMI.get(x["xona"], 0), x, t))
-            break
-    opts.sort(key=lambda o: (o[0], o[1]))
-    return [(x, t) for _, _, x, t in opts[:TAKLIF_SONI]]
-
-
-def group_label(g: dict) -> str:
-    s, e = g_interval(g)
-    return (f"{g['ustoz']} · {g['nomi']} — {g['izoh']}, {KUN_NOMI.get(g['kunlar'], g['kunlar'])} "
-            f"{fmt_min(s)}–{fmt_min(e)}, {g['xona']}, {g.get('talaba', '?')} talaba")
-
-
-def slot_label(x: dict, ustoz: str) -> str:
-    sig = XONA_SIGIMI.get(x["xona"])
-    sig_t = f" ({sig} kishilik)" if sig else ""
-    return f"{x['xona']}{sig_t} · {x['kunlar'].capitalize()} ({KUN_NOMI.get(x['kunlar'])}) {x['vaqt']} · {ustoz} Ustoz"
-
-
-def _suggest(lead: dict) -> tuple[list, list]:
-    found = match_groups(lead)
-    perfect = any(not miss for _, miss in found)
-    new = [] if perfect else new_group_options(lead)
-    return found, new
-
-
-def taklif_text(lead: dict) -> str:
-    """Excel ustuni uchun."""
-    found, new = _suggest(lead)
-    lines = []
-    for i, (g, miss) in enumerate(found, 1):
-        note = f" ({', '.join(miss)} mos emas)" if miss else ""
-        lines.append(f"{i}. {group_label(g)}{note}")
-    for x, t in new:
-        lines.append(f"Yangi guruh: {slot_label(x, t)}")
-    return "\n".join(lines) or "Mos guruh yo'q"
-
-
-def taklif_message(lead: dict) -> str:
-    """Bot javobi uchun."""
-    head = f"👤 {lead.get('ism', '?')} ({lead.get('daraja', '?')} · {lead.get('kurs', '?')} · {lead.get('vaqt', '?')})"
-    found, new = _suggest(lead)
-    lines = [head]
-    if found:
-        lines.append("Mos guruhlar:")
-        for i, (g, miss) in enumerate(found, 1):
-            mark = "✅" if not miss else "⚠️"
-            note = f" ({', '.join(miss)} mos emas)" if miss else ""
-            lines.append(f"{mark} {i}. {group_label(g)}{note}")
-    if new:
-        lines.append("🆕 Yangi guruh ochish mumkin:")
-        for x, t in new:
-            lines.append(f"• {slot_label(x, t)}")
-    if not found and not new:
-        lines.append("❗ Mos guruh ham, bo'sh xona-ustoz ham topilmadi.")
-    return "\n".join(lines)
+            known.add(k)
+            lead.setdefault("holat", "Yangi")
+            rows.append(lead)
+            added += 1
+        return added, dup
 
 
 # ---------------------------------------------------------------- Excel yasash
@@ -342,9 +188,16 @@ THIN = Side(style="thin", color="9BB7D4")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
 LEFT = Alignment(horizontal="left", vertical="center", wrap_text=True)
+HOLAT_FONT = {
+    "Guruhga qo'shildi": Font(bold=True, color="0D6B55"),
+    "Rad etdi": Font(color="B42318"),
+    "Qo'ng'iroq qilindi": Font(color="8F540B"),
+}
 
 
 def build_workbook() -> bytes:
+    with lock:
+        data_rows = [dict(r) for r in rows]
     wb = Workbook()
     ws = wb.active
     ws.title = "Lidlar"
@@ -355,8 +208,7 @@ def build_workbook() -> bytes:
     # 1-qator: "Ma'lumotlar" umumiy sarlavha, qolganlari 2 qatorga birlashtirilgan
     for i, (_, title, width) in enumerate(ALL_COLS, start=1):
         ws.column_dimensions[get_column_letter(i)].width = width
-        in_info = info_start <= i <= info_end
-        if not in_info:
+        if not (info_start <= i <= info_end):
             ws.cell(row=1, column=i, value=title)
             ws.merge_cells(start_row=1, start_column=i, end_row=2, end_column=i)
         else:
@@ -374,34 +226,29 @@ def build_workbook() -> bytes:
     ws.row_dimensions[1].height = 22
     ws.row_dimensions[2].height = 20
 
-    # Ma'lumot qatorlari
-    for idx, lead in enumerate(rows, start=1):
+    for idx, lead in enumerate(data_rows, start=1):
         r = idx + 2
         for c, (key, _, _) in enumerate(ALL_COLS, start=1):
-            if key == "n":
-                val = idx
-            elif key == "taklif":
-                val = taklif_text(lead)
-            else:
-                val = lead.get(key, "")
+            val = idx if key == "n" else lead.get(key, "")
             cell = ws.cell(row=r, column=c, value=val)
             cell.border = BORDER
-            cell.alignment = CENTER if key in ("n", "daraja", "vaqt", "manba", "sana", "tel") else LEFT
+            cell.alignment = LEFT if key in ("kurs", "ism", "guruh") else CENTER
             if key == "tel":
                 cell.number_format = "@"
             if key == "sana" and isinstance(val, datetime):
                 cell.number_format = "dd.mm.yyyy hh:mm"
+            if key == "holat" and val in HOLAT_FONT:
+                cell.font = HOLAT_FONT[val]
             if idx % 2 == 0:
                 cell.fill = ZEBRA
 
     ws.freeze_panes = "A3"
+    ws.auto_filter.ref = f"A2:{get_column_letter(len(ALL_COLS))}{max(len(data_rows) + 2, 2)}"
     ws.page_setup.orientation = "landscape"
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "1:2"
-    last = len(rows) + 2
-    ws.auto_filter.ref = f"A2:{get_column_letter(len(ALL_COLS))}{max(last, 2)}"
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -417,7 +264,7 @@ def build_workbook() -> bytes:
 def load_workbook_bytes(data: bytes) -> list[dict]:
     """Bot yasagan Excel'ni qayta o'qiydi (tiklash uchun) - ustunlarni sarlavha nomidan taniydi."""
     ws = load_workbook(io.BytesIO(data)).active
-    by_title = {title: key for key, title, _ in ALL_COLS if key not in ("n", "taklif")}
+    by_title = {title: key for key, title, _ in ALL_COLS if key != "n"}
     colmap = {}
     for c in range(1, ws.max_column + 1):
         title = ws.cell(row=2, column=c).value or ws.cell(row=1, column=c).value
@@ -431,8 +278,113 @@ def load_workbook_bytes(data: bytes) -> list[dict]:
             if val not in (None, ""):
                 lead[key] = val if isinstance(val, datetime) else str(val)
         if lead.get("tel") or lead.get("ism"):
+            lead.setdefault("holat", "Yangi")
             loaded.append(lead)
     return loaded
+
+
+# ---------------------------------------------------------------- Dastur uchun API
+def lead_json(lead: dict) -> dict:
+    sana = lead.get("sana")
+    return {
+        "id": lead_id(lead),
+        "ism": str(lead.get("ism", "")),
+        "tel": str(lead.get("tel", "")),
+        "daraja": str(lead.get("daraja", "")),
+        "kurs": str(lead.get("kurs", "")),
+        "kun": str(lead.get("kun", "")),
+        "vaqt": str(lead.get("vaqt", "")),
+        "manba": str(lead.get("manba", "")),
+        "sana": sana.strftime("%Y-%m-%dT%H:%M:%S") if isinstance(sana, datetime) else str(sana or ""),
+        "holat": str(lead.get("holat", "Yangi")),
+        "guruh": str(lead.get("guruh", "")),
+    }
+
+
+def api_update(body: dict) -> dict | None:
+    with lock:
+        for lead in rows:
+            if lead_id(lead) == body.get("id"):
+                if "holat" in body and body["holat"] in HOLATLAR:
+                    lead["holat"] = body["holat"]
+                if "guruh" in body:
+                    lead["guruh"] = str(body["guruh"])[:200]
+                state["dirty"] = True
+                return lead_json(lead)
+    return None
+
+
+def dastur_link() -> str:
+    return f"{SELF_URL}/?k={WEB_KEY}" if SELF_URL else ""
+
+
+class Web(BaseHTTPRequestHandler):
+    def _send(self, code: int, body: bytes, ctype: str) -> None:
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _json(self, code: int, obj) -> None:
+        self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
+
+    def _authed(self) -> bool:
+        k = self.headers.get("X-Key") or parse_qs(urlparse(self.path).query).get("k", [""])[0]
+        return hmac.compare_digest(k, WEB_KEY)
+
+    def do_HEAD(self):
+        self.do_GET()
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/api/leads":
+            if not self._authed():
+                return self._json(403, {"error": "kalit noto'g'ri"})
+            with lock:
+                data = [lead_json(r) for r in rows]
+            return self._json(200, {"leads": data, "holatlar": HOLATLAR})
+        if path in ("/", "/index.html"):
+            try:
+                with open(INDEX_FILE, "rb") as f:
+                    return self._send(200, f.read(), "text/html; charset=utf-8")
+            except OSError:
+                return self._send(200, b"OK", "text/plain")
+        return self._send(404, b"Not found", "text/plain")
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/lead":
+            return self._send(404, b"Not found", "text/plain")
+        if not self._authed():
+            return self._json(403, {"error": "kalit noto'g'ri"})
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(min(n, 10000)) or b"{}")
+        except (ValueError, json.JSONDecodeError):
+            return self._json(400, {"error": "noto'g'ri so'rov"})
+        updated = api_update(body)
+        if not updated:
+            return self._json(404, {"error": "lid topilmadi"})
+        return self._json(200, updated)
+
+    def log_message(self, *a):
+        pass
+
+
+def run_web():
+    port = int(os.environ.get("PORT", "10000"))
+    ThreadingHTTPServer(("0.0.0.0", port), Web).serve_forever()
+
+
+def self_ping():
+    while True:
+        time.sleep(9 * 60)
+        try:
+            urllib.request.urlopen(SELF_URL, timeout=20).read()
+        except Exception as e:
+            log.warning("Ping xatosi: %s", e)
 
 
 # ---------------------------------------------------------------- Telegram
@@ -444,14 +396,17 @@ def allowed(update: Update) -> bool:
     return not ADMIN_IDS or (update.effective_user and update.effective_user.id in ADMIN_IDS)
 
 
+def excel_name() -> str:
+    return f"lidlar_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
+
+
 async def send_excel(chat_id: int, bot) -> None:
     if not rows:
         await bot.send_message(chat_id, "Hozircha lid yo'q.")
         return
     data = build_workbook()
-    name = f"lidlar_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
     msg = await bot.send_document(
-        chat_id, document=data, filename=name, caption=f"📊 Jami: {len(rows)} ta lid"
+        chat_id, document=data, filename=excel_name(), caption=f"📊 Jami: {len(rows)} ta lid"
     )
     # Eng so'nggi faylni pin qilamiz - server qayta ishga tushsa, shundan tiklanadi
     try:
@@ -459,8 +414,36 @@ async def send_excel(chat_id: int, bot) -> None:
             await bot.unpin_chat_message(chat_id, message_id=last_pinned[chat_id])
         await bot.pin_chat_message(chat_id, msg.message_id, disable_notification=True)
         last_pinned[chat_id] = msg.message_id
-    except Exception as e:  # pin bo'lmasa ham ish to'xtamaydi
+    except Exception as e:
         log.warning("Pin xatosi: %s", e)
+    state["dirty"] = False
+
+
+async def persist_loop(app: Application) -> None:
+    """Dasturda o'zgarish bo'lsa, pin qilingan Excel'ni jimgina yangilab qo'yadi (yangi xabar yubormasdan)."""
+    while True:
+        await asyncio.sleep(15)
+        if not state["dirty"]:
+            continue
+        state["dirty"] = False
+        chats = list(last_pinned) or list(ADMIN_IDS)
+        for chat_id in chats:
+            try:
+                if chat_id in last_pinned:
+                    media = InputMediaDocument(
+                        media=build_workbook(), filename=excel_name(), caption=f"📊 Jami: {len(rows)} ta lid"
+                    )
+                    await app.bot.edit_message_media(media=media, chat_id=chat_id, message_id=last_pinned[chat_id])
+                else:
+                    await send_excel(chat_id, app.bot)
+            except Exception as e:
+                log.warning("Excel yangilash xatosi (%s): %s", chat_id, e)
+                if "not modified" not in str(e).lower():
+                    try:
+                        last_pinned.pop(chat_id, None)
+                        await send_excel(chat_id, app.bot)
+                    except Exception as e2:
+                        log.warning("Excel qayta yuborish xatosi: %s", e2)
 
 
 async def _delayed_send(chat_id: int, bot) -> None:
@@ -487,13 +470,26 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Assalamu alaykum! Lid xabarlarini shu yerga tashlang (forward yoki nusxa) — "
         "men ularni Excel jadvalga qo'shib boraman.\n\n"
+        "/dastur — guruh qidiruvi dasturi (lidlarni guruhga joylash)\n"
         "/excel — jadvalni hozir olish\n"
         "/soni — nechta lid borligi\n"
-        "/guruhlar — guruhlar ro'yxati\n"
-        "/xonalar — bo'sh xonalar\n"
         "/tozalash — hammasini o'chirish\n\n"
         "Eski Excel faylni yuborsangiz, undagi lidlarni ham qo'shib oladi.\n\n"
         f"Sizning ID: {uid}"
+    )
+
+
+async def cmd_dastur(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    link = dastur_link()
+    if not link:
+        await update.message.reply_text("Bot linki topilmadi. Render'da SELF_URL o'zgaruvchisini qo'ying.")
+        return
+    await update.message.reply_text(
+        f"📋 Guruh qidiruvi dasturi:\n{link}\n\n"
+        "Bu link — kalit. Uni boshqalarga bermang (ichida lidlarning raqamlari bor).",
+        disable_web_page_preview=True,
     )
 
 
@@ -503,46 +499,20 @@ async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if allowed(update):
-        await update.message.reply_text(f"Jami: {len(rows)} ta lid")
-
-
-async def cmd_groups(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
-    lines, last = [], None
-    for g in sorted(GURUHLAR, key=lambda g: (g["ustoz"], g["soat"])):
-        if g["ustoz"] != last:
-            lines.append(f"\n👨‍🏫 {g['ustoz']} Ustoz")
-            last = g["ustoz"]
-        lines.append("• " + group_label(g).split(" · ", 1)[1])
-    await update.message.reply_text("📚 Guruhlar:" + "\n".join(lines))
-
-
-async def cmd_rooms(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    if not allowed(update):
-        return
-    lines, last = [], None
-    for x, conflict in free_slots():
-        if x["xona"] != last:
-            sig = XONA_SIGIMI.get(x["xona"])
-            lines.append(f"\n🚪 {x['xona']}" + (f" ({sig} kishilik)" if sig else ""))
-            last = x["xona"]
-        if conflict:
-            st = f"❌ band: {conflict['ustoz']} · {conflict['nomi']} guruhi"
-        elif x.get("ustoz"):
-            st = f"🔸 {x['ustoz']} uchun" + (f" ({x['izoh']})" if x.get("izoh") else "")
-        else:
-            st = "✅ bo'sh"
-        lines.append(f"• {x['kunlar'].capitalize()} {x['vaqt']} — {st}")
-    await update.message.reply_text("🗓 Bo'sh xonalar:" + "\n".join(lines))
+    with lock:
+        counts = {h: sum(1 for r in rows if r.get("holat", "Yangi") == h) for h in HOLATLAR}
+    lines = [f"Jami: {len(rows)} ta lid"] + [f"• {h}: {n}" for h, n in counts.items() if n]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
     if ctx.args and ctx.args[0].lower() == "ha":
-        rows.clear()
+        with lock:
+            rows.clear()
         try:
             os.remove(LOCAL_FILE)
         except OSError:
@@ -570,12 +540,14 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     added, dup = add_leads(leads)
     parts = []
     if added:
-        parts.append(f"✅ Qo'shildi: {added} ta — jami {len(rows)}")
-        for lead in rows[-added:]:
-            parts.append(taklif_message(lead))
+        names = ", ".join(str(l.get("ism", "?")) for l in rows[-added:])
+        parts.append(f"✅ Qo'shildi: {added} ta ({names}) — jami {len(rows)}")
+        link = dastur_link()
+        if link:
+            parts.append(f"📋 Guruhga joylash: {link}")
     if dup:
         parts.append(f"↩️ Takror, o'tkazib yuborildi: {dup} ta")
-    await update.message.reply_text("\n\n".join(parts))
+    await update.message.reply_text("\n".join(parts), disable_web_page_preview=True)
     if added:
         schedule_send(update.effective_chat.id, ctx.bot)
 
@@ -600,51 +572,23 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def restore(app: Application) -> None:
     """Ishga tushganda: avval lokal fayl, bo'lmasa adminning chatidagi pin qilingan Exceldan tiklaydi."""
+    asyncio.create_task(persist_loop(app))
     if os.path.exists(LOCAL_FILE):
         with open(LOCAL_FILE, "rb") as f:
             add_leads(load_workbook_bytes(f.read()))
         log.info("Lokal fayldan tiklandi: %d", len(rows))
-        return
     for admin in ADMIN_IDS:
         try:
             chat = await app.bot.get_chat(admin)
             pm = chat.pinned_message
             if pm and pm.document and (pm.document.file_name or "").endswith(".xlsx"):
-                f = await pm.document.get_file()
-                add_leads(load_workbook_bytes(bytes(await f.download_as_bytearray())))
                 last_pinned[admin] = pm.message_id
-                log.info("Pin qilingan fayldan tiklandi (%s): %d", admin, len(rows))
+                if not rows:
+                    f = await pm.document.get_file()
+                    add_leads(load_workbook_bytes(bytes(await f.download_as_bytearray())))
+                    log.info("Pin qilingan fayldan tiklandi (%s): %d", admin, len(rows))
         except Exception as e:
             log.warning("Tiklashda xato (%s): %s", admin, e)
-
-
-# ---------------------------------------------------------------- Render uchun: web + self-ping
-class Health(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-    def do_HEAD(self):
-        self.send_response(200)
-        self.end_headers()
-
-    def log_message(self, *a):
-        pass
-
-
-def run_web():
-    port = int(os.environ.get("PORT", "10000"))
-    HTTPServer(("0.0.0.0", port), Health).serve_forever()
-
-
-def self_ping():
-    while True:
-        time.sleep(9 * 60)
-        try:
-            urllib.request.urlopen(SELF_URL, timeout=20).read()
-        except Exception as e:
-            log.warning("Ping xatosi: %s", e)
 
 
 def main():
@@ -666,11 +610,10 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("dastur", cmd_dastur))
     app.add_handler(CommandHandler("excel", cmd_excel))
     app.add_handler(CommandHandler("soni", cmd_count))
     app.add_handler(CommandHandler("tozalash", cmd_clear))
-    app.add_handler(CommandHandler("guruhlar", cmd_groups))
-    app.add_handler(CommandHandler("xonalar", cmd_rooms))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
