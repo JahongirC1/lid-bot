@@ -10,7 +10,9 @@ Lid -> Excel bot + Guruh qidiruvi dasturi
 
 Env o'zgaruvchilar (Render > Environment):
   BOT_TOKEN   - BotFather bergan token (majburiy)
-  ADMIN_IDS   - botdan foydalana oladiganlar ID si, vergul bilan: 123456789,987654321
+  ADMIN_IDS   - bosh admin(lar) ID si, vergul bilan: 123456789,987654321
+                Yordamchilar botning o'zida qo'shiladi: yordamchi /start yozadi,
+                bosh adminga "Ruxsat berish" tugmasi keladi. Ro'yxat: /yordamchilar
   SELF_URL    - (ixtiyoriy) bot linki; bo'lmasa Render bergan RENDER_EXTERNAL_URL olinadi
   SEND_DELAY  - oxirgi lid tushgandan keyin necha soniyada Excel yuborilsin (standart 4)
 """
@@ -33,9 +35,10 @@ from urllib.parse import parse_qs, urlparse
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
-from telegram import InputMediaDocument, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaDocument, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -81,7 +84,10 @@ ALL_COLS = LEFT_COLS + INFO_COLS + RIGHT_COLS
 
 rows: list[dict] = []  # barcha lidlar (xotirada)
 lock = threading.RLock()  # rows ga bot va dastur bir vaqtda tegmasligi uchun
-state = {"dirty": False}  # dasturda o'zgarish bo'ldi - Excel yangilansin
+state = {"dirty": False}  # o'zgarish bo'ldi - hammaning pin qilingan Excel'i yangilansin
+helpers: dict[int, str] = {}  # yordamchilar: {telegram_id: ism} - Excel'ning 2-varag'ida saqlanadi
+requests: dict[int, str] = {}  # ruxsat so'raganlar
+dead: set[int] = set()  # botga hali /start yozmagan (xabar yuborib bo'lmaydigan) chatlar
 
 # ---------------------------------------------------------------- Xabarni o'qish
 QUESTION_RE = re.compile(r"^\s*\d+\s*[.)]\s*(.+?)\s*:\s*(.*)$")
@@ -250,6 +256,17 @@ def build_workbook() -> bytes:
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.print_title_rows = "1:2"
 
+    hs = wb.create_sheet("Yordamchilar")
+    hs.append(["Telegram ID", "Ism"])
+    for c in (1, 2):
+        hs.cell(row=1, column=c).font = WHITE_BOLD
+        hs.cell(row=1, column=c).fill = HEAD_FILL
+    hs.column_dimensions["A"].width = 16
+    hs.column_dimensions["B"].width = 30
+    for uid, name in sorted(helpers.items()):
+        hs.append([str(uid), name])
+    wb.active = 0
+
     buf = io.BytesIO()
     wb.save(buf)
     data = buf.getvalue()
@@ -263,7 +280,12 @@ def build_workbook() -> bytes:
 
 def load_workbook_bytes(data: bytes) -> list[dict]:
     """Bot yasagan Excel'ni qayta o'qiydi (tiklash uchun) - ustunlarni sarlavha nomidan taniydi."""
-    ws = load_workbook(io.BytesIO(data)).active
+    wb = load_workbook(io.BytesIO(data))
+    ws = wb.worksheets[0]
+    if "Yordamchilar" in wb.sheetnames:
+        for row in wb["Yordamchilar"].iter_rows(min_row=2, values_only=True):
+            if row and row[0] and str(row[0]).strip().isdigit():
+                helpers.setdefault(int(str(row[0]).strip()), str(row[1] or ""))
     by_title = {title: key for key, title, _ in ALL_COLS if key != "n"}
     colmap = {}
     for c in range(1, ws.max_column + 1):
@@ -392,16 +414,31 @@ pending: dict[int, asyncio.Task] = {}
 last_pinned: dict[int, int] = {}
 
 
+def is_owner(uid: int | None) -> bool:
+    return not ADMIN_IDS or uid in ADMIN_IDS
+
+
 def allowed(update: Update) -> bool:
-    return not ADMIN_IDS or (update.effective_user and update.effective_user.id in ADMIN_IDS)
+    u = update.effective_user
+    if not u:
+        return False
+    ok = is_owner(u.id) or u.id in helpers
+    if ok:
+        dead.discard(u.id)
+    return ok
+
+
+def user_label(u) -> str:
+    name = " ".join(x for x in (u.first_name, u.last_name) if x) or "Ismsiz"
+    return f"{name} (@{u.username})" if u.username else name
 
 
 def excel_name() -> str:
     return f"lidlar_{datetime.now().strftime('%Y-%m-%d_%H-%M')}.xlsx"
 
 
-async def send_excel(chat_id: int, bot) -> None:
-    if not rows:
+async def send_excel(chat_id: int, bot, force: bool = False) -> None:
+    if not rows and not force:
         await bot.send_message(chat_id, "Hozircha lid yo'q.")
         return
     data = build_workbook()
@@ -416,18 +453,17 @@ async def send_excel(chat_id: int, bot) -> None:
         last_pinned[chat_id] = msg.message_id
     except Exception as e:
         log.warning("Pin xatosi: %s", e)
-    state["dirty"] = False
 
 
 async def persist_loop(app: Application) -> None:
-    """Dasturda o'zgarish bo'lsa, pin qilingan Excel'ni jimgina yangilab qo'yadi (yangi xabar yubormasdan)."""
+    """O'zgarish bo'lsa, bosh admin va yordamchilarning pin qilingan Excel'ini jimgina yangilaydi."""
     while True:
         await asyncio.sleep(15)
         if not state["dirty"]:
             continue
         state["dirty"] = False
-        chats = list(last_pinned) or list(ADMIN_IDS)
-        for chat_id in chats:
+        targets = (set(last_pinned) | set(ADMIN_IDS) | set(helpers)) - dead
+        for chat_id in targets:
             try:
                 if chat_id in last_pinned:
                     media = InputMediaDocument(
@@ -435,15 +471,20 @@ async def persist_loop(app: Application) -> None:
                     )
                     await app.bot.edit_message_media(media=media, chat_id=chat_id, message_id=last_pinned[chat_id])
                 else:
-                    await send_excel(chat_id, app.bot)
+                    await send_excel(chat_id, app.bot, force=True)
             except Exception as e:
+                err = str(e).lower()
+                if "not modified" in err:
+                    continue
+                if "forbidden" in err or "chat not found" in err or "blocked" in err:
+                    dead.add(chat_id)  # botga hali /start yozmagan
+                    continue
                 log.warning("Excel yangilash xatosi (%s): %s", chat_id, e)
-                if "not modified" not in str(e).lower():
-                    try:
-                        last_pinned.pop(chat_id, None)
-                        await send_excel(chat_id, app.bot)
-                    except Exception as e2:
-                        log.warning("Excel qayta yuborish xatosi: %s", e2)
+                try:
+                    last_pinned.pop(chat_id, None)
+                    await send_excel(chat_id, app.bot, force=True)
+                except Exception as e2:
+                    log.warning("Excel qayta yuborish xatosi: %s", e2)
 
 
 async def _delayed_send(chat_id: int, bot) -> None:
@@ -463,19 +504,42 @@ def schedule_send(chat_id: int, bot) -> None:
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    uid = update.effective_user.id
+    u = update.effective_user
+    uid = u.id
     if not allowed(update):
-        await update.message.reply_text(f"Sizga ruxsat yo'q. ID: {uid}")
+        if uid in requests:
+            await update.message.reply_text("⏳ So'rovingiz yuborilgan, bosh admin ruxsat berishini kuting.")
+            return
+        requests[uid] = user_label(u)
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Ruxsat berish", callback_data=f"add:{uid}"),
+            InlineKeyboardButton("❌ Rad etish", callback_data=f"no:{uid}"),
+        ]])
+        sent = False
+        for owner in ADMIN_IDS:
+            try:
+                await ctx.bot.send_message(
+                    owner, f"👤 {requests[uid]} (ID: {uid}) botdan yordamchi sifatida foydalanmoqchi.", reply_markup=kb
+                )
+                sent = True
+            except Exception as e:
+                log.warning("So'rov yuborilmadi (%s): %s", owner, e)
+        await update.message.reply_text(
+            "📨 So'rovingiz bosh adminga yuborildi. Ruxsat berilgach, shu yerga xabar keladi."
+            if sent else f"Sizga ruxsat yo'q. ID: {uid}"
+        )
         return
+    role = "bosh admin" if is_owner(uid) else "yordamchi"
     await update.message.reply_text(
         "Assalamu alaykum! Lid xabarlarini shu yerga tashlang (forward yoki nusxa) — "
         "men ularni Excel jadvalga qo'shib boraman.\n\n"
         "/dastur — guruh qidiruvi dasturi (lidlarni guruhga joylash)\n"
         "/excel — jadvalni hozir olish\n"
         "/soni — nechta lid borligi\n"
-        "/tozalash — hammasini o'chirish\n\n"
+        "/tozalash — hammasini o'chirish (faqat bosh admin)\n"
+        "/yordamchilar — yordamchilar ro'yxati (faqat bosh admin)\n\n"
         "Eski Excel faylni yuborsangiz, undagi lidlarni ham qo'shib oladi.\n\n"
-        f"Sizning ID: {uid}"
+        f"Siz: {role} · ID: {uid}"
     )
 
 
@@ -491,6 +555,76 @@ async def cmd_dastur(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         "Bu link — kalit. Uni boshqalarga bermang (ichida lidlarning raqamlari bor).",
         disable_web_page_preview=True,
     )
+
+
+def helpers_markup() -> InlineKeyboardMarkup | None:
+    if not helpers:
+        return None
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(f"❌ {name or uid}", callback_data=f"del:{uid}")] for uid, name in sorted(helpers.items())]
+    )
+
+
+async def cmd_helpers(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    if not allowed(update):
+        return
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Yordamchilarni faqat bosh admin boshqaradi.")
+        return
+    if not helpers:
+        await update.message.reply_text(
+            "Hozircha yordamchi yo'q.\n\nQo'shish uchun: yordamchi botni ochib /start yozsin — "
+            "sizga \"✅ Ruxsat berish\" tugmasi keladi."
+        )
+        return
+    lines = ["👥 Yordamchilar (o'chirish uchun ismini bosing):"]
+    lines += [f"• {name} — ID {uid}" for uid, name in sorted(helpers.items())]
+    await update.message.reply_text("\n".join(lines), reply_markup=helpers_markup())
+
+
+async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    q = update.callback_query
+    if not is_owner(q.from_user.id):
+        await q.answer("Faqat bosh admin uchun", show_alert=True)
+        return
+    action, _, raw = (q.data or "").partition(":")
+    if not raw.isdigit():
+        await q.answer()
+        return
+    uid = int(raw)
+    if action == "add":
+        name = requests.pop(uid, "") or helpers.get(uid, "") or str(uid)
+        helpers[uid] = name
+        dead.discard(uid)
+        state["dirty"] = True
+        await q.answer("Qo'shildi")
+        await q.edit_message_text(f"✅ {name} yordamchi qilib qo'shildi.\nRo'yxat: /yordamchilar")
+        try:
+            await ctx.bot.send_message(
+                uid,
+                "✅ Sizga ruxsat berildi! Endi lid xabarlarini shu yerga tashlashingiz mumkin.\n\n"
+                "/dastur — guruh qidiruvi dasturi\n/excel — jadval\n/soni — lidlar soni",
+            )
+        except Exception as e:
+            log.warning("Yordamchiga xabar yuborilmadi: %s", e)
+    elif action == "no":
+        name = requests.pop(uid, str(uid))
+        await q.answer("Rad etildi")
+        await q.edit_message_text(f"❌ {name} so'rovi rad etildi.")
+    elif action == "del":
+        name = helpers.pop(uid, None)
+        last_pinned.pop(uid, None)
+        state["dirty"] = True
+        await q.answer("O'chirildi")
+        if name is not None:
+            try:
+                await ctx.bot.send_message(uid, "ℹ️ Botdan foydalanish ruxsatingiz bekor qilindi.")
+            except Exception:
+                pass
+        rest = "\n".join(f"• {n} — ID {i}" for i, n in sorted(helpers.items())) or "Yordamchi qolmadi."
+        await q.edit_message_text(f"🗑 {name or uid} o'chirildi.\n\n{rest}", reply_markup=helpers_markup())
+    else:
+        await q.answer()
 
 
 async def cmd_excel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -510,6 +644,9 @@ async def cmd_count(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if not allowed(update):
         return
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Hamma lidlarni faqat bosh admin o'chira oladi.")
+        return
     if ctx.args and ctx.args[0].lower() == "ha":
         with lock:
             rows.clear()
@@ -522,6 +659,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         last_pinned.pop(update.effective_chat.id, None)
+        state["dirty"] = True  # yordamchilarning Excel'i ham bo'shatiladi
         await update.message.reply_text("🗑 Hamma lidlar o'chirildi. Endi lidlarni qaytadan tashlashingiz mumkin.")
     else:
         await update.message.reply_text(
@@ -549,6 +687,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         parts.append(f"↩️ Takror, o'tkazib yuborildi: {dup} ta")
     await update.message.reply_text("\n".join(parts), disable_web_page_preview=True)
     if added:
+        state["dirty"] = True
         schedule_send(update.effective_chat.id, ctx.bot)
 
 
@@ -567,28 +706,40 @@ async def on_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await update.message.reply_text(f"📥 Fayldan qo'shildi: {added} ta, takror: {dup} ta. Jami: {len(rows)}")
     if added:
+        state["dirty"] = True
         schedule_send(update.effective_chat.id, ctx.bot)
 
 
+async def find_pinned(app: Application, chat_id: int):
+    try:
+        chat = await app.bot.get_chat(chat_id)
+        pm = chat.pinned_message
+        if pm and pm.document and (pm.document.file_name or "").endswith(".xlsx"):
+            last_pinned[chat_id] = pm.message_id
+            return pm
+    except Exception as e:
+        log.warning("Pin topilmadi (%s): %s", chat_id, e)
+    return None
+
+
 async def restore(app: Application) -> None:
-    """Ishga tushganda: avval lokal fayl, bo'lmasa adminning chatidagi pin qilingan Exceldan tiklaydi."""
+    """Ishga tushganda: avval lokal fayl, bo'lmasa eng so'nggi pin qilingan Excel'dan tiklaydi."""
     asyncio.create_task(persist_loop(app))
     if os.path.exists(LOCAL_FILE):
         with open(LOCAL_FILE, "rb") as f:
             add_leads(load_workbook_bytes(f.read()))
         log.info("Lokal fayldan tiklandi: %d", len(rows))
-    for admin in ADMIN_IDS:
+    pins = [p for p in [await find_pinned(app, a) for a in ADMIN_IDS] if p]
+    if not rows and pins:
+        latest = max(pins, key=lambda p: p.edit_date or p.date)
         try:
-            chat = await app.bot.get_chat(admin)
-            pm = chat.pinned_message
-            if pm and pm.document and (pm.document.file_name or "").endswith(".xlsx"):
-                last_pinned[admin] = pm.message_id
-                if not rows:
-                    f = await pm.document.get_file()
-                    add_leads(load_workbook_bytes(bytes(await f.download_as_bytearray())))
-                    log.info("Pin qilingan fayldan tiklandi (%s): %d", admin, len(rows))
+            f = await latest.document.get_file()
+            add_leads(load_workbook_bytes(bytes(await f.download_as_bytearray())))
+            log.info("Pin qilingan fayldan tiklandi: %d lid, %d yordamchi", len(rows), len(helpers))
         except Exception as e:
-            log.warning("Tiklashda xato (%s): %s", admin, e)
+            log.warning("Tiklashda xato: %s", e)
+    for h in list(helpers):  # yordamchilarning pin qilingan Excel'ini ham topib qo'yamiz
+        await find_pinned(app, h)
 
 
 def main():
@@ -614,6 +765,8 @@ def main():
     app.add_handler(CommandHandler("excel", cmd_excel))
     app.add_handler(CommandHandler("soni", cmd_count))
     app.add_handler(CommandHandler("tozalash", cmd_clear))
+    app.add_handler(CommandHandler("yordamchilar", cmd_helpers))
+    app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
